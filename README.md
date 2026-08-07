@@ -5,10 +5,17 @@ LangChain + a local Ollama model (no API key or cost).
 
 ## How the "memory" works
 LLMs are stateless — they don't remember anything by themselves.
-"Memory" just means: **we keep a growing list of every message
-(yours + the bot's) and re-send the whole list on every turn.**
-That's what `chat_history` does in `app.py`. Type `reset` in the
-chat to clear it and start fresh.
+"Memory" just means: **we keep track of past messages and re-send
+them on every turn.**
+
+This version uses LangChain's `ConversationBufferWindowMemory`,
+which only keeps the last `WINDOW_SIZE` exchanges (set to 5 by
+default in `app.py`) instead of the entire conversation. Once you
+go past that, the oldest exchange is automatically dropped — so
+the amount of text sent to the model (and your token usage) stays
+flat no matter how long the chat runs, instead of growing forever.
+Type `reset` in the chat to clear memory and start fresh, or change
+`WINDOW_SIZE` in `app.py` to remember more/fewer exchanges.
 
 ## Setup
 1. Install Ollama: https://ollama.com/download
@@ -37,8 +44,6 @@ Bot: Your name is Peter.
 ```
 
 ## Next steps (once this works)
-- Swap the in-memory list for LangChain's `ConversationBufferWindowMemory`
-  to auto-limit history length (keeps token usage down on long chats).
 - Wrap this in FastAPI to serve it as a web API (matches your other
   chatbot project).
 - Add persistent memory (SQLite) so it remembers across restarts,

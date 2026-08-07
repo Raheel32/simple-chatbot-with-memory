@@ -1,8 +1,15 @@
 """
 Simple CLI Chatbot with Memory
 --------------------------------
-Uses LangChain + a local Ollama model so the bot remembers earlier
-messages in the same conversation (short-term / session memory).
+Uses LangChain + a local Ollama model. Memory is handled by
+ConversationBufferWindowMemory, which only keeps the last `k`
+exchanges instead of the entire conversation — so token usage
+(and cost/latency, if you ever swap in a paid API) stays flat
+even on very long chats.
+
+Note: ConversationBufferWindowMemory is a deprecated "classic" memory
+class — as of LangChain 1.0 it lives in the separate langchain-classic
+package (still works fine, just no longer in the core langchain package).
 
 Prerequisites:
 1. Install Ollama: https://ollama.com/download
@@ -12,23 +19,27 @@ Prerequisites:
 """
 
 from langchain_ollama import ChatOllama
-from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
+from langchain_core.messages import SystemMessage
+from langchain_classic.memory import ConversationBufferWindowMemory
 
 # ---- Config ----
 MODEL_NAME = "llama3.2"   # change to any model you've pulled with `ollama pull`
 SYSTEM_PROMPT = "You are a helpful, friendly assistant. Keep answers concise."
+WINDOW_SIZE = 5            # how many user<->bot exchanges to remember (not total messages)
 
 
 def main():
     # Initialize the local LLM
     llm = ChatOllama(model=MODEL_NAME, temperature=0.7)
 
-    # This list IS the memory — every message (yours and the bot's)
-    # stays here and gets sent back on every turn, so the model has
-    # full context of the conversation so far.
-    chat_history = [SystemMessage(content=SYSTEM_PROMPT)]
+    # ConversationBufferWindowMemory keeps only the last WINDOW_SIZE
+    # (human, ai) exchange pairs. Once you go over that, the oldest
+    # exchange is dropped automatically — you never have to trim
+    # anything by hand.
+    memory = ConversationBufferWindowMemory(k=WINDOW_SIZE, return_messages=True)
 
-    print("Simple Chatbot (type 'exit' to quit, 'reset' to clear memory)\n")
+    print(f"Simple Chatbot (remembers last {WINDOW_SIZE} exchanges)")
+    print("Type 'exit' to quit, 'reset' to clear memory\n")
 
     while True:
         user_input = input("You: ").strip()
@@ -38,21 +49,28 @@ def main():
             break
 
         if user_input.lower() == "reset":
-            chat_history = [SystemMessage(content=SYSTEM_PROMPT)]
+            memory.clear()
             print("Bot: Memory cleared.\n")
             continue
 
         if not user_input:
             continue
 
-        # 1. Add the user's message to memory
-        chat_history.append(HumanMessage(content=user_input))
+        # 1. Add the user's message into the windowed memory
+        memory.chat_memory.add_user_message(user_input)
 
-        # 2. Send the FULL history (memory) to the model
-        response = llm.invoke(chat_history)
+        # 2. Pull out only the messages the window has kept, and
+        #    prepend the system prompt (the system prompt isn't
+        #    part of the window, so it never gets trimmed away).
+        windowed_history = memory.load_memory_variables({})["history"]
+        messages = [SystemMessage(content=SYSTEM_PROMPT)] + windowed_history
 
-        # 3. Add the bot's reply to memory too, so it remembers what it said
-        chat_history.append(AIMessage(content=response.content))
+        # 3. Send just that trimmed window to the model
+        response = llm.invoke(messages)
+
+        # 4. Save the bot's reply into memory too, so future turns
+        #    see it (until it eventually ages out of the window)
+        memory.chat_memory.add_ai_message(response.content)
 
         print(f"Bot: {response.content}\n")
 

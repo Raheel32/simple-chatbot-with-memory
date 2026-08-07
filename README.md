@@ -43,8 +43,47 @@ You: What's my name?
 Bot: Your name is Peter.
 ```
 
+## Running as a web API (main.py)
+The same chatbot logic is also available as a FastAPI web service in
+`main.py`, so it can be called from a browser, frontend, or another
+app instead of the terminal.
+
+1. Make sure Ollama is running and dependencies are installed (same
+   setup as above — `requirements.txt` now also includes `fastapi`
+   and `uvicorn`).
+2. Start the server:
+   ```bash
+   uvicorn main:app --reload
+   ```
+3. Open **http://127.0.0.1:8000/docs** — FastAPI's built-in interactive
+   UI where you can try the endpoints directly in the browser.
+
+### Endpoints
+- `POST /chat` — send a message, get a reply
+  ```json
+  { "session_id": "peter-1", "message": "My name is Peter" }
+  ```
+  returns
+  ```json
+  { "reply": "Nice to meet you, Peter!" }
+  ```
+- `POST /reset/{session_id}` — clear one session's memory
+- `GET /` — health check
+
+### Why `session_id`?
+A web API can serve many users at once, so there's no single shared
+"conversation" like there was in the CLI version. Each `session_id`
+gets its own memory window — send the same `session_id` on every
+request from a given user/chat window so the bot remembers them, and
+a different `session_id` per user so their histories don't mix.
+
+**Note:** session memory currently lives in RAM (a plain Python dict
+in `main.py`), so it clears if the server restarts. That's fine for
+development; production would need a persistent store like Redis or
+a database instead.
+
 ## Next steps (once this works)
-- Wrap this in FastAPI to serve it as a web API (matches your other
-  chatbot project).
-- Add persistent memory (SQLite) so it remembers across restarts,
-  not just within one run.
+- Add persistent memory (SQLite/Redis) so sessions survive server
+  restarts, not just within one run.
+- Add authentication so `session_id` can't be guessed/spoofed by
+  other users.

@@ -59,16 +59,46 @@ app instead of the terminal.
    UI where you can try the endpoints directly in the browser.
 
 ### Endpoints
-- `POST /chat` — send a message, get a reply
+- `POST /session/start` — **call this first.** Requires `X-API-Key`
+  header. Returns a fresh, unguessable `session_id`:
   ```json
-  { "session_id": "peter-1", "message": "My name is Peter" }
+  { "session_id": "kR7f...(long random string)" }
+  ```
+- `POST /chat` — requires `X-API-Key` header + a `session_id` from
+  `/session/start`:
+  ```json
+  { "session_id": "kR7f...", "message": "My name is Peter" }
   ```
   returns
   ```json
   { "reply": "Nice to meet you, Peter!" }
   ```
-- `POST /reset/{session_id}` — clear one session's memory
-- `GET /` — health check
+- `POST /reset/{session_id}` — requires `X-API-Key`; clears and
+  permanently deletes that session
+- `GET /` — health check (no auth needed)
+
+### Setting up your API key
+1. Copy `.env.example` to a new file named `.env`.
+2. Replace the placeholder with a real random string (or several,
+   comma-separated, if you want multiple valid keys):
+   ```
+   API_KEYS=my-super-secret-dev-key
+   ```
+3. `.env` is gitignored — it will never be pushed to GitHub.
+
+### Why authentication now, on top of session_id?
+Before this change, anyone who saw or guessed a `session_id` (e.g. a
+short, predictable string) could read or continue someone else's
+conversation just by sending it. Two things fix that:
+- `session_id` is now a long random token from `/session/start` —
+  effectively unguessable.
+- Every request also needs the **same API key** that created the
+  session. So even in the unlikely case a session_id leaked, it's
+  useless without the matching key too.
+
+In `/docs`, click the **Authorize** button (top right) and paste
+your key once — it'll be sent automatically on every request you
+try from that page.
 
 ### Why `session_id`?
 A web API can serve many users at once, so there's no single shared
@@ -77,13 +107,23 @@ gets its own memory window — send the same `session_id` on every
 request from a given user/chat window so the bot remembers them, and
 a different `session_id` per user so their histories don't mix.
 
-**Note:** session memory currently lives in RAM (a plain Python dict
-in `main.py`), so it clears if the server restarts. That's fine for
-development; production would need a persistent store like Redis or
-a database instead.
+**Note:** session memory is persisted to a local SQLite file
+(`chat_memory.db`, created automatically on first run) via
+LangChain's `SQLChatMessageHistory`. Restarting the server does
+NOT clear conversations — send the same `session_id` again and
+the bot picks up right where it left off. Use `POST /reset/{session_id}`
+to permanently clear one session's history.
+
+For multi-server / high-traffic setups, swap SQLite for Redis —
+`main.py` has a commented-out snippet showing exactly what to
+change (`RedisChatMessageHistory` instead of `SQLChatMessageHistory`,
+plus a running Redis server). SQLite is the default here because it
+needs no extra setup, which is enough for a local project or single
+server.
 
 ## Next steps (once this works)
-- Add persistent memory (SQLite/Redis) so sessions survive server
-  restarts, not just within one run.
-- Add authentication so `session_id` can't be guessed/spoofed by
-  other users.
+- Add a message limit / auto-expiry so `chat_memory.db` doesn't grow
+  forever for long-lived sessions.
+- Move from simple shared API keys to per-user accounts (e.g. with
+  OAuth or JWT) if this ever needs real multi-user login instead of
+  a handful of hardcoded keys.

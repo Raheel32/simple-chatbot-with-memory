@@ -84,6 +84,8 @@ app instead of the terminal.
   ```
 - `POST /reset/{session_id}` — requires the token; clears and
   permanently deletes that session
+- `POST /auth/logout` — requires the token; invalidates it
+  immediately instead of waiting for it to expire on its own
 - `GET /` — health check (no auth needed)
 
 ### Setting up your .env
@@ -155,8 +157,33 @@ Two separate protections keep `chat_memory.db` from growing forever:
 Both numbers are constants near the top of `main.py` — change them
 if 200 messages or 30 days doesn't fit your use case.
 
+### Logout / early token revocation
+JWTs are normally "stateless" — the server doesn't track them, so
+there's no built-in way to invalidate one before it naturally
+expires. To get around that, every token now carries a unique ID
+(`jti`). Calling `POST /auth/logout` records that ID in a small
+`revoked_tokens` table; from then on, that specific token is
+rejected even though it hasn't technically expired yet. Useful if a
+device is lost or a token leaks somewhere it shouldn't have.
+
+Note this only revokes the one token you're currently using — if
+you're logged in on two devices, logging out on one doesn't affect
+the other's token. Old revocation records are pruned automatically
+by the same background cleanup that handles session expiry, once
+the token they refer to would have expired anyway.
+
+### Rate limiting
+`/chat` is capped at `CHAT_RATE_LIMIT` (10 requests/minute by
+default) **per account**, not per IP address — so switching Wi-Fi
+networks doesn't reset the limit, and multiple people on the same
+network (e.g. a school connection) don't share one limit. Going over
+it returns a `429 Too Many Requests` response. Adjust
+`CHAT_RATE_LIMIT` in `main.py` (e.g. `"30/minute"`) if 10/minute is
+too strict for testing.
+
 ## Next steps (once this works)
-- Add a `/auth/logout` / token-revocation mechanism — right now a
-  token simply stops working when it expires; there's no way to
-  invalidate one early (e.g. if a device is lost).
-- Add rate limiting so one account can't spam `/chat`.
+- Add a `/auth/logout-all` that revokes every token for a user at
+  once (currently logout only invalidates the one token you sent).
+- Add refresh tokens, so users don't have to log in again every
+  `ACCESS_TOKEN_EXPIRE_MINUTES` — a short-lived access token plus a
+  longer-lived refresh token is the usual pattern.

@@ -59,12 +59,21 @@ app instead of the terminal.
    UI where you can try the endpoints directly in the browser.
 
 ### Endpoints
-- `POST /session/start` — **call this first.** Requires `X-API-Key`
-  header. Returns a fresh, unguessable `session_id`:
+- `POST /auth/register` — create an account:
+  ```json
+  { "username": "peter", "password": "at-least-8-characters" }
+  ```
+- `POST /auth/login` — log in (form fields, not JSON — see below),
+  returns a JWT:
+  ```json
+  { "access_token": "eyJhbGciOi...", "token_type": "bearer" }
+  ```
+- `POST /session/start` — requires `Authorization: Bearer <token>`.
+  Returns a fresh, unguessable `session_id`:
   ```json
   { "session_id": "kR7f...(long random string)" }
   ```
-- `POST /chat` — requires `X-API-Key` header + a `session_id` from
+- `POST /chat` — requires the token + a `session_id` from
   `/session/start`:
   ```json
   { "session_id": "kR7f...", "message": "My name is Peter" }
@@ -73,39 +82,49 @@ app instead of the terminal.
   ```json
   { "reply": "Nice to meet you, Peter!" }
   ```
-- `POST /reset/{session_id}` — requires `X-API-Key`; clears and
+- `POST /reset/{session_id}` — requires the token; clears and
   permanently deletes that session
 - `GET /` — health check (no auth needed)
 
-### Setting up your API key
+### Setting up your .env
 1. Copy `.env.example` to a new file named `.env`.
-2. Replace the placeholder with a real random string (or several,
-   comma-separated, if you want multiple valid keys):
+2. Generate a real secret key and paste it in:
+   ```bash
+   python -c "import secrets; print(secrets.token_hex(32))"
    ```
-   API_KEYS=my-super-secret-dev-key
+   ```
+   SECRET_KEY=<paste the generated value here>
    ```
 3. `.env` is gitignored — it will never be pushed to GitHub.
 
-### Why authentication now, on top of session_id?
-Before this change, anyone who saw or guessed a `session_id` (e.g. a
-short, predictable string) could read or continue someone else's
-conversation just by sending it. Two things fix that:
-- `session_id` is now a long random token from `/session/start` —
-  effectively unguessable.
-- Every request also needs the **same API key** that created the
-  session. So even in the unlikely case a session_id leaked, it's
-  useless without the matching key too.
+### Using accounts in /docs
+1. Open `/auth/register`, try it out, register a username/password.
+2. Open `/auth/login` — note this one takes form fields (`username`,
+   `password`), not raw JSON, because it follows the OAuth2 password
+   flow FastAPI expects. Try it and copy the `access_token` from the
+   response.
+3. Click the green **Authorize** button (top right of `/docs`) and
+   paste just the token (no need to type "Bearer", Swagger adds that
+   for you). Now every request from that page includes it
+   automatically.
 
-In `/docs`, click the **Authorize** button (top right) and paste
-your key once — it'll be sent automatically on every request you
-try from that page.
+### Why real accounts instead of shared API keys?
+Shared keys meant everyone using the same key could see and reset
+each other's sessions, and there was no way to know who did what.
+With accounts:
+- Each person registers their own username/password.
+- Logging in proves who you are and issues a token that expires
+  (`ACCESS_TOKEN_EXPIRE_MINUTES`, 60 by default) — so a leaked token
+  stops working on its own after a while, unlike a permanent shared
+  key.
+- Sessions are tied to a username, so one person's login can never
+  see or reset another person's conversation, even by accident.
 
 ### Why `session_id`?
 A web API can serve many users at once, so there's no single shared
 "conversation" like there was in the CLI version. Each `session_id`
 gets its own memory window — send the same `session_id` on every
-request from a given user/chat window so the bot remembers them, and
-a different `session_id` per user so their histories don't mix.
+request from a given chat window so the bot remembers them.
 
 **Note:** session memory is persisted to a local SQLite file
 (`chat_memory.db`, created automatically on first run) via
@@ -115,15 +134,29 @@ the bot picks up right where it left off. Use `POST /reset/{session_id}`
 to permanently clear one session's history.
 
 For multi-server / high-traffic setups, swap SQLite for Redis —
-`main.py` has a commented-out snippet showing exactly what to
-change (`RedisChatMessageHistory` instead of `SQLChatMessageHistory`,
-plus a running Redis server). SQLite is the default here because it
-needs no extra setup, which is enough for a local project or single
-server.
+`main.py`'s earlier version had a commented-out snippet for
+`RedisChatMessageHistory`; ask if you want that added back in on
+top of this version.
+
+### Message limit and auto-expiry
+Two separate protections keep `chat_memory.db` from growing forever:
+- **`MAX_MESSAGES_PER_SESSION`** (200 by default) — after every chat
+  turn, only the most recent N messages are kept per session; older
+  ones are deleted from SQLite. This is independent of `WINDOW_SIZE`,
+  which controls how much of that history is sent to the LLM per
+  request — trimming controls storage, `WINDOW_SIZE` controls what
+  the model sees.
+- **`SESSION_EXPIRY_DAYS`** (30 by default) — a session untouched for
+  that long is deleted entirely (both its record and its messages).
+  Cleanup runs once at server startup, then automatically every 24
+  hours in the background while the server keeps running — no manual
+  step needed.
+
+Both numbers are constants near the top of `main.py` — change them
+if 200 messages or 30 days doesn't fit your use case.
 
 ## Next steps (once this works)
-- Add a message limit / auto-expiry so `chat_memory.db` doesn't grow
-  forever for long-lived sessions.
-- Move from simple shared API keys to per-user accounts (e.g. with
-  OAuth or JWT) if this ever needs real multi-user login instead of
-  a handful of hardcoded keys.
+- Add a `/auth/logout` / token-revocation mechanism — right now a
+  token simply stops working when it expires; there's no way to
+  invalidate one early (e.g. if a device is lost).
+- Add rate limiting so one account can't spam `/chat`.

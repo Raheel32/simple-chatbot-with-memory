@@ -29,6 +29,17 @@ Changes from the previous version:
      24 hours in the background for as long as the server keeps
      running.
 
+4. LOGOUT / TOKEN REVOCATION
+   - Every token now carries a unique ID (`jti`). POST /auth/logout
+     records that ID in a revoked-tokens table, so the token stops
+     working immediately — instead of waiting for it to expire on
+     its own. Useful if a device is lost or a token leaks.
+
+5. RATE LIMITING
+   - /chat is limited to CHAT_RATE_LIMIT per account (default:
+     10 requests/minute), so one account can't hammer the endpoint
+     (and, if you later swap Ollama for a paid API, run up a bill).
+
 Run:
     uvicorn main:app --reload
 
@@ -43,11 +54,14 @@ from datetime import datetime, timedelta, timezone
 from contextlib import contextmanager, asynccontextmanager
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pydantic import BaseModel
 import bcrypt
-from jose import JWTError, jwt
+from jose import JWTError, ExpiredSignatureError, jwt
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
 from langchain_ollama import ChatOllama
 from langchain_core.messages import SystemMessage
 from langchain_classic.memory import ConversationBufferWindowMemory
@@ -62,6 +76,7 @@ WINDOW_SIZE = 5                    # exchanges sent to the LLM per request
 MAX_MESSAGES_PER_SESSION = 200     # hard cap on stored messages per session
 SESSION_EXPIRY_DAYS = 30           # sessions idle longer than this get deleted
 CLEANUP_INTERVAL_SECONDS = 24 * 60 * 60  # how often the background cleanup runs
+CHAT_RATE_LIMIT = "10/minute"      # per-account limit on the /chat endpoint
 
 DB_FILE = "chat_memory.db"
 DB_PATH = f"sqlite:///{DB_FILE}"
@@ -114,6 +129,12 @@ def get_db():
             conn.execute(
                 "ALTER TABLE sessions ADD COLUMN last_active TEXT DEFAULT CURRENT_TIMESTAMP"
             )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS revoked_tokens (
+                   jti TEXT PRIMARY KEY,
+                   expires_at TEXT NOT NULL
+               )"""
+        )
         yield conn
         conn.commit()
     finally:
@@ -139,8 +160,37 @@ def verify_password(plain: str, hashed: str) -> bool:
 
 def create_access_token(username: str) -> str:
     expire = datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    payload = {"sub": username, "exp": expire}
+    payload = {"sub": username, "exp": expire, "jti": secrets.token_hex(16)}
     return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
+
+
+def is_token_revoked(jti: str) -> bool:
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT jti FROM revoked_tokens WHERE jti = ?", (jti,)
+        ).fetchone()
+    return row is not None
+
+
+def revoke_token(jti: str, expires_at: datetime) -> None:
+    with get_db() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO revoked_tokens (jti, expires_at) VALUES (?, ?)",
+            (jti, expires_at.isoformat()),
+        )
+
+
+def cleanup_expired_revocations() -> int:
+    """Revocation entries are only needed until the token itself
+    would have expired anyway - after that, prune them so the table
+    doesn't grow forever."""
+    now = utcnow_iso()
+    with get_db() as conn:
+        expired = conn.execute(
+            "SELECT jti FROM revoked_tokens WHERE expires_at < ?", (now,)
+        ).fetchall()
+        conn.execute("DELETE FROM revoked_tokens WHERE expires_at < ?", (now,))
+    return len(expired)
 
 
 def get_current_user(token: str = Depends(oauth2_scheme)) -> str:
@@ -152,10 +202,16 @@ def get_current_user(token: str = Depends(oauth2_scheme)) -> str:
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         username = payload.get("sub")
-        if username is None:
+        jti = payload.get("jti")
+        if username is None or jti is None:
             raise unauthorized
+    except ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token has expired, please log in again")
     except JWTError:
         raise unauthorized
+
+    if is_token_revoked(jti):
+        raise HTTPException(status_code=401, detail="Token has been logged out, please log in again")
 
     with get_db() as conn:
         row = conn.execute(
@@ -164,6 +220,23 @@ def get_current_user(token: str = Depends(oauth2_scheme)) -> str:
     if row is None:
         raise unauthorized
     return username
+
+
+def get_current_user_and_jti(token: str = Depends(oauth2_scheme)) -> tuple[str, str, datetime]:
+    """Same checks as get_current_user, but also hands back the jti
+    and expiry - only /auth/logout needs these, so it's kept separate
+    rather than changing every route's return type."""
+    unauthorized = HTTPException(status_code=401, detail="Invalid or expired token")
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username = payload.get("sub")
+        jti = payload.get("jti")
+        exp = payload.get("exp")
+        if username is None or jti is None or exp is None:
+            raise unauthorized
+    except JWTError:
+        raise unauthorized
+    return username, jti, datetime.fromtimestamp(exp, tz=timezone.utc)
 
 
 # ---------- Session ownership ----------
@@ -238,22 +311,55 @@ def cleanup_expired_sessions() -> int:
 async def periodic_cleanup():
     while True:
         await asyncio.sleep(CLEANUP_INTERVAL_SECONDS)
-        removed = cleanup_expired_sessions()
-        if removed:
-            print(f"[cleanup] removed {removed} expired session(s)")
+        removed_sessions = cleanup_expired_sessions()
+        removed_tokens = cleanup_expired_revocations()
+        if removed_sessions or removed_tokens:
+            print(f"[cleanup] removed {removed_sessions} expired session(s), "
+                  f"{removed_tokens} stale revocation record(s)")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    removed = cleanup_expired_sessions()
-    if removed:
-        print(f"[startup cleanup] removed {removed} expired session(s)")
+    removed_sessions = cleanup_expired_sessions()
+    removed_tokens = cleanup_expired_revocations()
+    if removed_sessions or removed_tokens:
+        print(f"[startup cleanup] removed {removed_sessions} expired session(s), "
+              f"{removed_tokens} stale revocation record(s)")
     task = asyncio.create_task(periodic_cleanup())
     yield
     task.cancel()
 
 
 app = FastAPI(title="Simple Chatbot with Memory", lifespan=lifespan)
+
+
+# ---------- Rate limiting ----------
+
+def rate_limit_key(request: Request) -> str:
+    """Rate-limit per logged-in account rather than per IP, so it
+    can't be dodged by switching networks, and so shared networks
+    (e.g. a school Wi-Fi) don't get one account's limit applied to
+    everyone on it. Falls back to IP address if there's no valid
+    token (e.g. hitting /auth/login too fast)."""
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.startswith("Bearer "):
+        token = auth_header[len("Bearer "):]
+        try:
+            payload = jwt.decode(
+                token, SECRET_KEY, algorithms=[ALGORITHM],
+                options={"verify_exp": False},  # just identifying the caller here
+            )
+            username = payload.get("sub")
+            if username:
+                return f"user:{username}"
+        except JWTError:
+            pass
+    return get_remote_address(request)
+
+
+limiter = Limiter(key_func=rate_limit_key)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 
 # ---------- Chat memory helpers ----------
@@ -328,6 +434,16 @@ def login(form_data: OAuth2PasswordRequestForm = Depends()):
     return TokenResponse(access_token=token)
 
 
+@app.post("/auth/logout")
+def logout(auth: tuple[str, str, datetime] = Depends(get_current_user_and_jti)):
+    """Invalidates the token that's sent with this request. The
+    token was going to expire eventually anyway - this just makes
+    it stop working right now, e.g. because a device was lost."""
+    _username, jti, expires_at = auth
+    revoke_token(jti, expires_at)
+    return {"status": "logged out"}
+
+
 # ---------- Chat routes ----------
 
 @app.post("/session/start", response_model=SessionResponse)
@@ -337,7 +453,8 @@ def start_session(username: str = Depends(get_current_user)):
 
 
 @app.post("/chat", response_model=ChatResponse)
-def chat(req: ChatRequest, username: str = Depends(get_current_user)):
+@limiter.limit(CHAT_RATE_LIMIT)
+def chat(request: Request, req: ChatRequest, username: str = Depends(get_current_user)):
     if not session_belongs_to(req.session_id, username):
         raise HTTPException(status_code=403, detail="Invalid session")
 
